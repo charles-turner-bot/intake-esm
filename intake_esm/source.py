@@ -159,6 +159,8 @@ def _update_attrs(*, additional_attrs, ds):
 def _expand_dims(expand_dims, ds):
     if expand_dims:
         for variable in ds.attrs[OPTIONS['vars_key']]:
+            if variable not in ds.data_vars:
+                continue  # Only expand data variables, not coords
             ds[variable] = ds[variable].expand_dims(**expand_dims)
 
     return ds
@@ -315,10 +317,11 @@ class ESMDataSource(DataSource):
                         datasets, **self.xarray_combine_by_coords_kwargs
                     )
                 except ValueError as exc:
-                    if (
-                        str(exc)
-                        == 'Could not find any dimension coordinates to use to order the datasets for concatenation'
-                    ):
+                    if str(exc) in [
+                        # Error message changed in https://github.com/pydata/xarray/commit/ad92a166ee301302a02cc6f975d0899430806a86
+                        'Could not find any dimension coordinates to use to order the Dataset objects for concatenation',
+                        'Could not find any dimension coordinates to use to order the datasets for concatenation',
+                    ]:
                         warnings.warn(
                             'Attempting to concatenate datasets without valid dimension coordinates: retaining only first dataset.'
                             ' Request valid dimension coordinate to silence this warning.',
