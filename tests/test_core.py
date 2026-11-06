@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 from unittest import mock
 
@@ -709,3 +710,89 @@ def test__get_threaded(mock_get_env, threaded, ITK_ESM_THREADING, expected):
             intake_esm.core._get_threaded(threaded)
     else:
         assert intake_esm.core._get_threaded(threaded) == expected
+
+
+@pytest.mark.parametrize(
+    'groupby_attrs, varying_attrs',
+    [
+        (['source_id', 'table_id'], ['source_id']),
+        (['source_id', 'experiment_id', 'table_id'], ['source_id', 'experiment_id']),
+    ],
+)
+def test_to_dask_error_names_varying_groupby_attrs(groupby_attrs, varying_attrs):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        variable_id='tasmax', table_id='Amon'
+    )
+    cat.esmcat.aggregation_control.groupby_attrs = groupby_attrs
+    assert len(cat) > 1
+    with pytest.raises(ValueError, match=f'Received {len(cat)} datasets') as exc:
+        cat.to_dask()
+    assert f'refine your search on {", ".join(varying_attrs)} or' in str(exc.value)
+    assert '.to_dataset_dict()' in str(exc.value)
+
+
+def test_to_dask_error_with_method_named_grouping_column():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        variable_id='tasmax', table_id='Amon'
+    )
+    cat.df['items'] = cat.df['source_id']
+    cat.esmcat.aggregation_control.groupby_attrs = ['items', 'table_id']
+    assert len(cat) > 1
+    with pytest.raises(ValueError, match='refine your search on items or'):
+        cat.to_dask()
+
+
+def test_to_dask_error_for_empty_search():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='not-a-model-in-this-catalog'
+    )
+    assert len(cat) == 0
+    with pytest.raises(ValueError, match='Received 0 datasets'):
+        cat.to_dask()
+
+
+def test_to_dask_returns_real_single_dataset():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='BCC-ESM1', variable_id='tasmax', experiment_id='piControl'
+    )
+    assert len(cat) == 1
+    ds = cat.to_dask(
+        threaded=False, xarray_open_kwargs={'engine': 'h5netcdf', 'chunks': {}}, progressbar=False
+    )
+    try:
+        with xr.open_dataset(cat.df.path.iloc[0], engine='h5netcdf') as original:
+            xr.testing.assert_equal(ds.tasmax.isel(member_id=0, drop=True), original.tasmax)
+    finally:
+        ds.close()
+
+
+@pytest.mark.parametrize('dtype', [pl.List(pl.String), pl.List(pl.Categorical)])
+def test_iterable_schema_overrides(dtype):
+    cat = intake.open_esm_datastore(
+        multi_variable_cat,
+        columns_with_iterables=['variable'],
+        read_kwargs={'schema_overrides': {'variable': dtype, 'component': pl.Categorical}},
+    )
+    expected = pd.read_csv(cat.esmcat.catalog_file, converters={'variable': ast.literal_eval})
+    assert cat.esmcat.pl_df.schema['variable'] == dtype
+    assert cat.esmcat.pl_df.schema['component'] == pl.Categorical
+    assert cat.esmcat.pl_df['variable'].to_list() == [list(v) for v in expected.variable]
+    assert cat.esmcat.pl_df['component'].to_list() == expected.component.tolist()
+
+
+def test_numeric_iterable_schema_override(tmp_path):
+    with open(multi_variable_cat) as f:
+        metadata = json.load(f)
+    source = intake.open_esm_datastore(multi_variable_cat, columns_with_iterables=['variable'])
+    table = pd.read_csv(source.esmcat.catalog_file)
+    table['levels'] = str([1, 2])
+    table.to_csv(tmp_path / 'catalog.csv', index=False)
+    metadata['catalog_file'] = 'catalog.csv'
+    (tmp_path / 'catalog.json').write_text(json.dumps(metadata))
+    cat = intake.open_esm_datastore(
+        tmp_path / 'catalog.json',
+        columns_with_iterables=['variable', 'levels'],
+        read_kwargs={'schema_overrides': {'levels': pl.List(pl.Int64)}},
+    )
+    assert cat.esmcat.pl_df.schema['levels'] == pl.List(pl.Int64)
+    assert cat.esmcat.pl_df['levels'].to_list() == [[1, 2]] * len(table)
