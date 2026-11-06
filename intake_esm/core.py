@@ -101,7 +101,14 @@ class esm_datastore(Catalog):
         df_reader: typing.Literal['polars', 'pandas', 'infer'] | None = None,
         **intake_kwargs: dict[str, typing.Any],
     ):
-        """Intake Catalog representing an ESM Collection."""
+        """Intake Catalog representing an ESM Collection.
+
+        ``df_reader`` selects the CSV reader: ``polars`` (the default), ``pandas``,
+        or ``infer`` (pandas for CSV, Polars for Parquet). An explicit value takes
+        precedence over ``ITK_ESM_DF_READER``. ZIP/XZ/BZ2/ZST CSVs fall back to
+        pandas; Parquet always uses Polars. This selects file I/O, not a pluggable
+        query backend. Pandas Parquet reading and Polars writing are unsupported.
+        """
         super().__init__(**intake_kwargs)
         self.storage_options = storage_options or {}
 
@@ -138,7 +145,7 @@ class esm_datastore(Catalog):
             self.threaded = threaded
 
         if df_reader is None:
-            self.df_reader = os.getenv('ITK_ESM_DF_READER', 'infer')
+            self.df_reader = os.getenv('ITK_ESM_DF_READER', 'polars')
         else:
             self.df_reader = df_reader
 
