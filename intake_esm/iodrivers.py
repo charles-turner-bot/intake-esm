@@ -41,9 +41,9 @@ class FramesModel(pydantic.BaseModel):
             return self.df
 
         pl_df = self.lf.collect()  # type: ignore[union-attr]
-        self.df = pl_df.to_pandas(use_pyarrow_extension_array=False)
-        for colname in self.columns_with_iterables:
-            self.df[colname] = self.df[colname].apply(tuple)
+        self.df = pl_df.to_pandas(use_pyarrow_extension_array=True)
+        columns = [col for col in self.columns_with_iterables if self.df[col].dtype == 'object']
+        self.df[columns] = self.df[columns].map(tuple)
         return self.df
 
     @property

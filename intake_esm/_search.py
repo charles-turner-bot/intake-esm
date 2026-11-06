@@ -7,8 +7,6 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-pl.Config.set_engine_affinity('streaming')
-
 
 def unpack_iterable_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
     """Return a DataFrame where elements of a given iterable column have been unpacked into multiple lines."""
@@ -45,6 +43,8 @@ def is_pattern(value: str | typing.Pattern | Collection) -> bool:
 
 
 def is_stringtype(series):
+    if isinstance(series.dtype, pd.ArrowDtype) and pd.api.types.is_string_dtype(series.dtype):
+        return True
     if series.dtype == 'object' and pd.api.types.infer_dtype(series, skipna=True) == 'string':
         return True
     # scalar
@@ -115,9 +115,8 @@ def pl_search(
     columns_with_iterables: set
         Names of columns in the lazy dataframe whose values contain iterables.
     iterable_dtypes: dict, optional
-        A dictionary mapping column names to their iterable dtypes. If not provided,
-        tuple is assumed for iterable columns. Typically unused, unless a lazy
-        dataframe with, for example, set iterables has been passed explicitly.
+        Optional explicit Python container conversions for iterable columns.
+        Without an override, retain Arrow-backed list storage in the result.
     Returns
     -------
     dataframe: :py:class:`~pandas.DataFrame`
@@ -137,11 +136,20 @@ def pl_search(
     if isinstance(columns_with_iterables, str):
         columns_with_iterables = [columns_with_iterables]
 
-    iterable_dtypes = iterable_dtypes or {colname: tuple for colname in columns_with_iterables}
+    iterable_dtypes = iterable_dtypes or {}
 
     for colname, dtype in iterable_dtypes.items():
         if dtype == np.ndarray:
             iterable_dtypes[colname] = tuple
+
+    # Retain upstream iterable regex support; scalar regex stays in Polars.
+    if any(
+        is_pattern(values) for column, values in query.items() if column in columns_with_iterables
+    ):
+        df = lf.collect().to_pandas(use_pyarrow_extension_array=True)
+        for colname, dtype in iterable_dtypes.items():
+            df[colname] = df[colname].astype(object).apply(dtype)
+        return search(df=df, query=query, columns_with_iterables=columns_with_iterables)
 
     query_non_iterable = {
         key: val for key, val in query.items() if key not in columns_with_iterables
@@ -164,32 +172,14 @@ def pl_search(
 
     query_iterable = {key: val for key, val in query.items() if key in columns_with_iterables}
     for colname, subquery in query_iterable.items():
-        if is_pattern(subquery):
-            raise NotImplementedError(
-                'Pattern matching within iterable columns is not implemented yet.'
-            )
-            case_insensitive = [
-                bool(q.flags & re.IGNORECASE) if isinstance(q, re.Pattern) else False
-                for q in subquery
-            ]
-            # Prepend (?i) to patterns for case insensitive matching if needed
-            subquery = [q.pattern if isinstance(q, re.Pattern) else q for q in subquery]
-            subquery = [f'(?i){q}' if ci else q for q, ci in zip(subquery, case_insensitive)]
+        lf = lf.filter(
+            pl.col(colname).list.eval(pl.element().is_in(subquery, nulls_equal=True)).list.any()
+        )
 
-            lf = lf.filter(
-                pl.col(colname)
-                .list.eval(pl.element().str.contains('|'.join(subquery), literal=False))
-                .any()
-            )
-        else:
-            lf = lf.filter(
-                pl.col(colname).list.eval(pl.element().is_in(subquery, nulls_equal=True)).list.any()
-            )
-
-    df = lf.collect().to_pandas()
+    df = lf.collect().to_pandas(use_pyarrow_extension_array=True)
 
     for colname, dtype in iterable_dtypes.items():
-        df[colname] = df[colname].apply(dtype)
+        df[colname] = df[colname].astype(object).apply(dtype)
 
     return df
 
