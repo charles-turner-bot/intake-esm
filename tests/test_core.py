@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import re
 import tempfile
 import warnings
 from pathlib import Path
@@ -1109,6 +1110,9 @@ def test_search__frames_df_is_None(df_reader):
     [
         (cdf_cat_sample_cmip6, {'source_id': ['CNRM-CM6-1', 'BCC-ESM1']}, None),
         (cdf_cat_sample_cmip6, {'source_id': ['^CNRM.*']}, None),
+        (cdf_cat_sample_cmip6, {'source_id': [re.compile('cnrm', re.IGNORECASE)]}, None),
+        (cdf_cat_sample_cmip6, {'source_id': [re.compile('(?=CNRM).*')]}, None),
+        (cdf_cat_sample_cmip6, {'source_id': ['^CNRM.*', None]}, None),
         (cdf_cat_sample_cmip6, {'dcpp_init_year': [None]}, None),
         (cdf_cat_sample_cmip6, {'source_id': ['not-a-real-model']}, None),
         (cdf_cat_sample_cmip6, {}, None),

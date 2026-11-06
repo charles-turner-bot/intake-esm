@@ -89,11 +89,15 @@ def search(
                     iterable_contains, value=value, regex=is_pattern(value) & column_is_stringtype
                 )
             elif column_is_stringtype and is_pattern(value):
-                mask = df[column].str.contains(value, regex=True, case=True, flags=0)
+                strings = df[column]
+                if isinstance(strings.dtype, pd.ArrowDtype):
+                    strings = strings.astype('string[python]')
+                mask = strings.str.contains(value, regex=True, case=True, flags=0)
             elif pd.isna(value):
                 mask = df[column].isnull()
             else:
                 mask = df[column] == value
+            mask = mask.fillna(False)
             local_mask = local_mask | mask
         global_mask = global_mask & local_mask
     results = df.loc[global_mask]
@@ -151,6 +155,7 @@ def pl_search(
             df[colname] = df[colname].astype(object).apply(dtype)
         return search(df=df, query=query, columns_with_iterables=columns_with_iterables)
 
+    source_lf = lf
     query_non_iterable = {
         key: val for key, val in query.items() if key not in columns_with_iterables
     }
@@ -158,6 +163,8 @@ def pl_search(
     for colname, subquery in query_non_iterable.items():
         subquery = [None if pd.isna(subq) else subq for subq in subquery]
         if is_pattern(subquery):
+            has_null = any(q is None for q in subquery)
+            subquery = [q for q in subquery if q is not None]
             case_insensitive = [
                 bool(q.flags & re.IGNORECASE) if isinstance(q, re.Pattern) else False
                 for q in subquery
@@ -166,7 +173,10 @@ def pl_search(
             subquery = [q.pattern if isinstance(q, re.Pattern) else q for q in subquery]
             subquery = [f'(?i){q}' if ci else q for q, ci in zip(subquery, case_insensitive)]
 
-            lf = lf.filter(pl.col(colname).str.contains('|'.join(subquery), literal=False))
+            mask = pl.col(colname).str.contains('|'.join(subquery), literal=False)
+            if has_null:
+                mask = mask | pl.col(colname).is_null()
+            lf = lf.filter(mask)
         else:
             lf = lf.filter(pl.col(colname).is_in(subquery, nulls_equal=True))
 
@@ -176,7 +186,16 @@ def pl_search(
             pl.col(colname).list.eval(pl.element().is_in(subquery, nulls_equal=True)).list.any()
         )
 
-    df = lf.collect().to_pandas(use_pyarrow_extension_array=True)
+    try:
+        df = lf.collect().to_pandas(use_pyarrow_extension_array=True)
+    except pl.exceptions.ComputeError as exc:
+        if 'regex error:' not in str(exc):
+            raise
+        # Fall back only when Polars cannot compile a Python regex pattern.
+        df = source_lf.collect().to_pandas(use_pyarrow_extension_array=True)
+        for colname, dtype in iterable_dtypes.items():
+            df[colname] = df[colname].astype(object).apply(dtype)
+        return search(df=df, query=query, columns_with_iterables=columns_with_iterables)
 
     for colname, dtype in iterable_dtypes.items():
         df[colname] = df[colname].astype(object).apply(dtype)
