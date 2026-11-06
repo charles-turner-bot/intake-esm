@@ -37,6 +37,8 @@ def is_stringtype(series):
         'large_string',
     ]:
         return True
+    if series.dtype == 'object' and pd.api.types.infer_dtype(series, skipna=True) == 'string':
+        return True
     # iterable (pandas has no list dtype, so it's pyarrow for sure)
     if series.dtype.type is list and series.dtype.pyarrow_dtype.value_type in [
         'string',

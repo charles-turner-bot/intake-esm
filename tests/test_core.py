@@ -439,7 +439,7 @@ def test_catalog_search_columns_with_iterables(path, columns_with_iterables, que
     cat = intake.open_esm_datastore(path, columns_with_iterables=columns_with_iterables)
 
     for iter_col in columns_with_iterables:
-        assert isinstance(cat.df[iter_col][0], list)
+        assert isinstance(cat.df[iter_col][0], tuple)
     new_cat = cat.search(**query)
     assert len(new_cat) == expected_size
 
@@ -509,20 +509,15 @@ def test_catalog_serialize(catalog_type, to_csv_kwargs, json_dump_kwargs, direct
     if directory is None:
         directory = os.getcwd()
     cat = intake.open_esm_datastore(f'{directory}/{name}.json')
-    subset_df = cat_subset.esmcat.pl_df.with_columns(
-        [
-            pl.col(colname).cast(pl.Null)
-            for colname in cat_subset.esmcat._frames.pl_df.columns
-            if cat_subset.esmcat._frames.pl_df.get_column(colname).is_null().all()
-        ]
+    # NumPy-backed pandas can round-trip all-missing numeric columns as NaN
+    # rather than null. Compare their missing values without relaxing other dtypes.
+    subset_df = cat_subset.esmcat.pl_df.with_columns(pl.col(pl.Float64).fill_nan(None))
+    subset_df = subset_df.with_columns(
+        [pl.col(col).cast(pl.Null) for col in subset_df.columns if subset_df[col].is_null().all()]
     )
-
-    df = cat.esmcat.pl_df.with_columns(
-        [
-            pl.col(colname).cast(pl.Null)
-            for colname in cat.esmcat._frames.pl_df.columns
-            if cat.esmcat._frames.pl_df.get_column(colname).is_null().all()
-        ]
+    df = cat.esmcat.pl_df.with_columns(pl.col(pl.Float64).fill_nan(None))
+    df = df.with_columns(
+        [pl.col(col).cast(pl.Null) for col in df.columns if df[col].is_null().all()]
     )
     assert_frame_equal_pl(
         subset_df,

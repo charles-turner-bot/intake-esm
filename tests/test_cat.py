@@ -1,3 +1,4 @@
+import ast
 import datetime as dt
 
 import pandas as pd
@@ -402,3 +403,30 @@ def test_esm_catalog_dates_are_pass_through():
         last_updated=dt.date(2025, 1, 1),
     )
     assert m.last_updated == dt.date(2025, 1, 1)
+
+
+@pytest.mark.parametrize('materialised', [False, True])
+@pytest.mark.parametrize('path', [cdf_cat_sample_cmip6, multi_variable_cat])
+def test_frames_numpy_conversion_preserves_catalogue(path, materialised):
+    read_kwargs = (
+        {'converters': {'variable': ast.literal_eval}} if path == multi_variable_cat else {}
+    )
+    cat = ESMCatalogModel.load(path, read_kwargs=read_kwargs)
+    lazy = cat.lf
+    expected = lazy.collect().to_pandas(use_pyarrow_extension_array=False)
+    iterable_columns = cat.columns_with_iterables
+    for column in iterable_columns:
+        expected[column] = expected[column].apply(tuple)
+    frames = FramesModel(pl_df=lazy.collect()) if materialised else FramesModel(lf=lazy)
+    actual = frames.pandas
+    pd.testing.assert_frame_equal(actual, expected)
+    assert not any(isinstance(dtype, pd.ArrowDtype) for dtype in actual.dtypes)
+    assert frames.pandas is actual
+
+
+def test_numpy_conversion_keeps_scalar_regex_search():
+    cat = ESMCatalogModel.load(cdf_cat_sample_cmip6)
+    expected = cat.df.loc[cat.df.source_id.str.startswith('CNRM'), :].reset_index(drop=True)
+    assert not expected.empty
+    actual = cat.search(query={'source_id': ['^CNRM.*']})
+    pd.testing.assert_frame_equal(actual, expected)
