@@ -110,9 +110,11 @@ def _open_dataset(
         # How should we handle concat_dim, and other xr.open_mfdataset kwargs?
         xarray_open_kwargs.update(preprocess=preprocess)
         xarray_open_kwargs.update(parallel=True)
-        ds = xr.open_mfdataset(url, **xarray_open_kwargs)
+        # ds = xr.open_mfdataset(url, **xarray_open_kwargs)
+        ds = _open_dataset_try_auto(url, xr.open_mfdataset, xarray_open_kwargs)
     else:
-        ds = xr.open_dataset(url, **xarray_open_kwargs)
+        # ds = xr.open_dataset(url, **xarray_open_kwargs)
+        ds = _open_dataset_try_auto(url, xr.open_dataset, xarray_open_kwargs)
         if preprocess is not None:
             ds = preprocess(ds)
 
@@ -143,6 +145,31 @@ def _open_dataset(
     return ds
 
 
+def _open_dataset_try_auto(url, func: typing.Callable, xarray_open_kwargs) -> xr.Dataset:
+    """
+    Try to open a dataset with chunks set to auto. If we fail because dask doesn't know how to chunk
+    it, set chunks to `{}` and retry. Handles cases where datasets contain things like string variables,
+    which can't be autochunked, as that's restricted to cftime arrays only.
+
+    Attempting to autochunk, rather than always using disk chunks (`{}`) is advantageous as it is generally
+    quite a lot more performant. Unfortunately, there is no straightforward way to detect which variables
+    within a dataset can and can't be autochunked without opening it.
+    """
+    try:
+        ds = func(url, **xarray_open_kwargs)
+    except NotImplementedError as exc:
+        if (
+            xarray_open_kwargs.get('chunks') == 'auto'
+            and 'Can not use auto rechunking with object dtype. We are unable to estimate the size in bytes of object data'
+            in str(exc)
+        ):
+            xarray_open_kwargs['chunks'] = {}
+            ds = func(url, **xarray_open_kwargs)
+        else:
+            raise exc
+    return ds
+
+
 def _update_attrs(*, additional_attrs, ds):
     additional_attrs = additional_attrs or {}
     if additional_attrs:
@@ -159,6 +186,8 @@ def _update_attrs(*, additional_attrs, ds):
 def _expand_dims(expand_dims, ds):
     if expand_dims:
         for variable in ds.attrs[OPTIONS['vars_key']]:
+            if variable not in ds.data_vars:
+                continue  # Only expand data variables, not coords
             ds[variable] = ds[variable].expand_dims(**expand_dims)
 
     return ds
@@ -315,10 +344,11 @@ class ESMDataSource(DataSource):
                         datasets, **self.xarray_combine_by_coords_kwargs
                     )
                 except ValueError as exc:
-                    if (
-                        str(exc)
-                        == 'Could not find any dimension coordinates to use to order the datasets for concatenation'
-                    ):
+                    if str(exc) in [
+                        # Error message changed in https://github.com/pydata/xarray/commit/ad92a166ee301302a02cc6f975d0899430806a86
+                        'Could not find any dimension coordinates to use to order the Dataset objects for concatenation',
+                        'Could not find any dimension coordinates to use to order the datasets for concatenation',
+                    ]:
                         warnings.warn(
                             'Attempting to concatenate datasets without valid dimension coordinates: retaining only first dataset.'
                             ' Request valid dimension coordinate to silence this warning.',
