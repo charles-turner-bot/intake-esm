@@ -349,3 +349,21 @@ def test_frames_preserve_arrow_catalogue(path, materialised):
     pd.testing.assert_frame_equal(frames.pandas, expected)
     assert all(isinstance(dtype, pd.ArrowDtype) for dtype in frames.pandas.dtypes)
     assert frames.pandas is frames.df
+
+
+@pytest.mark.parametrize('pattern', ['^CNRM.*', '(?=CNRM).*'])
+def test_arrow_conversion_preserves_scalar_regex_search(pattern):
+    cat = ESMCatalogModel.load(cdf_cat_sample_cmip6)
+    expected = cat.df.loc[cat.df.source_id.str.startswith('CNRM')].reset_index(drop=True)
+    assert not expected.empty
+    actual = cat.search(query={'source_id': [pattern]})
+    pd.testing.assert_frame_equal(actual, expected)
+    assert isinstance(actual.source_id.dtype, pd.ArrowDtype)
+
+
+def test_arrow_regex_and_missing_column_do_not_match_nulls():
+    cat = ESMCatalogModel.load(cdf_cat_sample_cmip6)
+    actual = cat.search(query={'source_id': ['^CNRM.*'], 'dcpp_init_year': ['2000']})
+    expected = cat.df.loc[cat.df.dcpp_init_year == '2000'].reset_index(drop=True)
+    assert expected.empty
+    pd.testing.assert_frame_equal(actual, expected)
