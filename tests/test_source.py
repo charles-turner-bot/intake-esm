@@ -1,22 +1,30 @@
 import os
 import tarfile
 import tempfile
+import warnings
 from unittest import mock
 
 import dask
+import intake
+import numpy as np
 import pytest
 import xarray
 from dask.delayed import DelayedLeaf
 
 from intake_esm.source import (
+    ConcatenationWarning,
+    ESMDataSourceError,
     _delayed_open_ds,
     _eager_open_ds,
+    _expand_dims,
     _get_open_func,
     _get_xarray_open_kwargs,
     _open_dataset,
     _update_attrs,
 )
 from intake_esm.utils import _zarr_async
+
+from .utils import cdf_cat_sample_cmip6
 
 dask.config.set(scheduler='single-threaded')
 
@@ -99,7 +107,7 @@ def test_open_dataset_kerchunk(kerchunk_file=kerchunk_file):
     # chunking
     xarray_open_kwargs = _get_xarray_open_kwargs(
         'reference',
-        dict(engine='zarr', consolidated=False, drop_variables='crs'),
+        dict(engine='zarr', consolidated=False),
         storage_options={
             'remote_protocol': 's3',
             'remote_options': {'anon': True, 'asynchronous': _zarr_async()},
@@ -205,3 +213,140 @@ def test_get_open_func(threaded, expected):
         assert open_func == _eager_open_ds
     else:
         assert isinstance(open_func, DelayedLeaf)
+
+
+def test_no_concat_coordinates_warns_and_retains_first_dataset():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='CNRM-CM6-1', variable_id='tasmax', experiment_id='historical'
+    )
+    # These real member files share coordinates. Without join_new they have
+    # no dimension along which combine_by_coords can order the two datasets.
+    cat.esmcat.aggregation_control.aggregations = [
+        agg for agg in cat.esmcat.aggregation_control.aggregations if agg.type != 'join_new'
+    ]
+    assert len(cat.df) == 2
+    with pytest.warns(ConcatenationWarning, match='retaining only first dataset'):
+        ds = cat.to_dask(
+            threaded=False,
+            xarray_open_kwargs={'engine': 'h5netcdf', 'chunks': {}},
+            progressbar=False,
+        )
+    try:
+        with xarray.open_dataset(cat.df.path.iloc[0], engine='h5netcdf') as first:
+            xarray.testing.assert_equal(ds.tasmax, first.tasmax)
+    finally:
+        ds.close()
+
+
+def test_other_combine_value_errors_are_not_swallowed():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='CNRM-CM6-1', variable_id='tasmax', experiment_id='historical'
+    )
+    cat.esmcat.aggregation_control.aggregations = [
+        agg for agg in cat.esmcat.aggregation_control.aggregations if agg.type != 'join_new'
+    ]
+
+    def reverse_second_member(ds):
+        if ds.attrs['variant_label'] == 'r6i1p1f2':
+            return ds.isel(time=slice(None, None, -1))
+        return ds
+
+    with warnings.catch_warnings(record=True) as caught:
+        with pytest.raises(ESMDataSourceError) as exc:
+            cat.to_dask(
+                preprocess=reverse_second_member,
+                threaded=False,
+                xarray_open_kwargs={'engine': 'h5netcdf', 'chunks': {}},
+                progressbar=False,
+            )
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert not any(issubclass(w.category, ConcatenationWarning) for w in caught)
+
+
+def test_expand_dims_coord_variable_regression():
+    """A catalog whose `variable` column includes a dimension coordinate (`time`)
+    must still load. Previously `_expand_dims` expanded `time` into a
+    `(member, time)` coordinate, destroying its index and breaking
+    `combine_by_coords` with an `ESMDataSourceError`.
+    """
+    cat_json = os.path.join(here, 'sample_data/expand-dims-coord/catalog.json')
+    cat = intake.open_esm_datastore(cat_json, columns_with_iterables=['variable'], threaded=False)
+    dsets = cat.to_dataset_dict(progressbar=False)
+    ds = dsets['by647.mon']
+    assert 'time' in ds.dims  # time index preserved, not expanded away
+    assert ds.sizes['time'] == 3
+    assert ds.time.dims == ('time',)
+    assert 'time' in ds.indexes
+    assert set(ds.member.values) == {'r1', 'r2'}
+    for member in ['r1', 'r2']:
+        path = os.path.join(here, 'sample_data/expand-dims-coord', f'regression_{member}.nc')
+        with xarray.open_dataset(path) as original:
+            np.testing.assert_array_equal(ds.time.values, original.time.values)
+            np.testing.assert_allclose(ds.tas.sel(member=member).values, original.tas.values)
+
+
+def test_expand_dims_still_expands_data_variables():
+    ds = xarray.Dataset({'tas': ('time', [1.0, 2.0])}, coords={'time': [0, 1]})
+    ds.attrs['intake_esm_vars'] = ['tas', 'time']
+    result = _expand_dims({'member': ['r1']}, ds)
+    assert result.tas.dims == ('member', 'time')
+    assert result.time.dims == ('time',)
+    np.testing.assert_array_equal(result.tas.values, [[1.0, 2.0]])
+
+
+@pytest.fixture
+def object_dtype_zarr(tmp_path):
+    # Keep the existing real NetCDF values, adding a variable-length string
+    # variable that Dask cannot automatically chunk.
+    with xarray.open_dataset(f1, engine='scipy') as source:
+        expected = source.load()
+    expected['labels'] = ('sample', np.array(['first', 'second'], dtype=object))
+    path = tmp_path / 'object.zarr'
+    expected.to_zarr(path, zarr_format=2)
+    return str(path), expected
+
+
+@pytest.mark.parametrize('multi_file', [False, True])
+def test_object_dtype_auto_chunk_fallback(object_dtype_zarr, multi_file):
+    path, expected = object_dtype_zarr
+    kwargs = {'engine': 'zarr', 'chunks': 'auto'}
+    open_func = xarray.open_mfdataset if multi_file else xarray.open_dataset
+    with pytest.raises(NotImplementedError, match='auto rechunking with object dtype'):
+        open_func(path, **kwargs)
+    with _open_dataset([path] if multi_file else path, None, xarray_open_kwargs=kwargs) as actual:
+        xarray.testing.assert_equal(actual.compute(), expected)
+
+
+@pytest.mark.parametrize('chunks', [None, {}, {'sample': 1}])
+def test_object_dtype_preserves_explicit_chunks(object_dtype_zarr, chunks):
+    path, expected = object_dtype_zarr
+    kwargs = {'engine': 'zarr', 'chunks': chunks}
+    with _open_dataset(path, None, xarray_open_kwargs=kwargs) as actual:
+        xarray.testing.assert_equal(actual.compute(), expected)
+        if chunks is None:
+            assert actual.labels.chunks is None
+        elif chunks == {'sample': 1}:
+            assert actual.labels.chunks == ((1, 1),)
+    assert kwargs['chunks'] == chunks
+
+
+def test_object_dtype_does_not_override_explicit_auto_dimension(object_dtype_zarr):
+    path, _ = object_dtype_zarr
+    with pytest.raises(NotImplementedError, match='auto rechunking with object dtype'):
+        _open_dataset(
+            path, None, xarray_open_kwargs={'engine': 'zarr', 'chunks': {'sample': 'auto'}}
+        )
+
+
+def test_chunk_fallback_preserves_unrelated_error():
+    with pytest.raises(ValueError, match='unrecognized engine'):
+        _open_dataset(f1, None, xarray_open_kwargs={'engine': 'not-an-engine', 'chunks': 'auto'})
+
+
+def test_numeric_and_cftime_keep_auto_chunks():
+    kwargs = {'engine': 'scipy', 'chunks': 'auto'}
+    with _open_dataset(f1, None, xarray_open_kwargs=kwargs) as actual:
+        with xarray.open_dataset(f1, engine='scipy') as expected:
+            xarray.testing.assert_equal(actual.compute(), expected)
+        assert actual.tasmax.chunks is not None
+    assert kwargs['chunks'] == 'auto'
