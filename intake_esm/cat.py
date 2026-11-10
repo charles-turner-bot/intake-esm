@@ -689,7 +689,12 @@ class CatalogFileDataReader:
                 storage_options=self.storage_options,
                 infer_schema=False,
                 **self.read_kwargs,
-            )
+        lf = pl.scan_csv(
+            self.catalog_file,
+            storage_options=self.storage_options,
+            infer_schema=False,
+            **self.read_kwargs,
+        )
 
         lf = lf.with_columns(
             [
