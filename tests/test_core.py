@@ -1,5 +1,9 @@
 import ast
+import json
 import os
+import tempfile
+import warnings
+from pathlib import Path
 from unittest import mock
 
 import intake
@@ -17,13 +21,16 @@ else:
     from xarray import DataTree
 
 import intake_esm
+from intake_esm.iodrivers import PandasCsvReader, PolarsCsvReader, PolarsParquetReader
 
 from .utils import (
+    access_columns_with_lists_bz2_cat,
     access_columns_with_lists_cat,
     access_columns_with_tuples_cat,
     catalog_dict_records,
     cdf_cat_sample_cesmle,
     cdf_cat_sample_cmip5,
+    cdf_cat_sample_cmip5_pq,
     cdf_cat_sample_cmip6,
     cdf_cat_sample_cmip6_noagg,
     mixed_cat_sample_cmip6,
@@ -187,6 +194,224 @@ def test_read_csv_conflict():
 
 
 @pytest.mark.parametrize(
+    'file_format_1',
+    [
+        'csv',
+        'parquet',
+    ],
+)
+@pytest.mark.parametrize(
+    'file_format_2',
+    [
+        'csv',
+        'parquet',
+    ],
+)
+def test_open_and_reserialize(tmp_path, file_format_1, file_format_2):
+    """
+    Open a catalog, and then re-serialize it into `tmp_path`. We want to
+    make sure that the reserialised catalog is the same as the original, but that
+    the catalog file is stored in the correct format.
+
+    Note: Round-trip twice as it seems the defaults have changed since the test dataset was
+    created. Only affects unspecified fields.
+    """
+    catalog = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    expected_table = catalog.df.copy(deep=True)
+
+    catalog.serialize(
+        name='serialized',
+        directory=tmp_path,
+        catalog_type='file',
+        file_format=file_format_1,
+        storage_options={},
+    )
+
+    catalog = intake.open_esm_datastore(tmp_path / 'serialized.json')
+    pd.testing.assert_frame_equal(catalog.df, expected_table, check_dtype=False)
+
+    catalog.serialize(
+        name='reserialized',
+        directory=tmp_path,
+        catalog_type='file',
+        file_format=file_format_2,
+        storage_options={},
+    )
+
+    with open(tmp_path / 'serialized.json') as f:
+        serialized = json.load(f)
+
+    with open(tmp_path / 'reserialized.json') as f:
+        reserialized = json.load(f)
+
+    assert serialized.get('catalog_file', '').endswith(file_format_1)
+    assert reserialized.get('catalog_file', '').endswith(file_format_2)
+
+    # Remove fields that are expected to change
+    changed_fieldnames = ['catalog_file', 'last_updated', 'id', 'title']
+    for field in changed_fieldnames:
+        serialized.pop(field, None)
+        reserialized.pop(field, None)
+
+    assert serialized == reserialized
+    reopened = intake.open_esm_datastore(tmp_path / 'reserialized.json')
+    pd.testing.assert_frame_equal(reopened.df, expected_table, check_dtype=False)
+
+
+@pytest.mark.parametrize('first_format', ['csv', 'parquet'])
+@pytest.mark.parametrize('second_format', ['csv', 'parquet'])
+def test_iterable_serialization_preserves_values(tmp_path, first_format, second_format):
+    """Iterable values survive repeated round trips between csv and parquet."""
+    read_kwargs = {'converters': {'variable': ast.literal_eval}}
+    catalog = intake.open_esm_datastore(access_columns_with_lists_cat, read_kwargs=read_kwargs)
+    expected = catalog.df.copy(deep=True)
+    expected['variable'] = expected['variable'].astype(object).apply(tuple)
+    for i, file_format in enumerate([first_format, second_format]):
+        name = f'roundtrip_{i}'
+        catalog.serialize(
+            name=name, directory=tmp_path, catalog_type='file', file_format=file_format
+        )
+        catalog = intake.open_esm_datastore(
+            tmp_path / f'{name}.json', read_kwargs=read_kwargs if file_format == 'csv' else None
+        )
+        actual = catalog.df.copy(deep=True)
+        actual['variable'] = actual['variable'].astype(object).apply(tuple)
+        pd.testing.assert_frame_equal(actual, expected, check_dtype=False)
+
+
+@pytest.mark.parametrize(
+    'literal, expected',
+    [
+        ("['a', 'b']", ('a', 'b')),
+        ("('a', 'b')", ('a', 'b')),
+        ("{'a', 'b'}", ('a', 'b')),
+        ("('a',)", ('a',)),
+    ],
+    ids=['list', 'tuple', 'set', 'single-item-tuple'],
+)
+def test_read_iterable_literals(tmp_path, literal, expected):
+    """Catalogs written with list, tuple or set literals in iterable columns can be read."""
+    pd.DataFrame({'path': ['a.nc', 'b.nc'], 'variable': [literal, literal]}).to_csv(
+        tmp_path / 'cat.csv', index=False
+    )
+    with open(tmp_path / 'cat.json', 'w') as f:
+        json.dump(
+            {
+                'esmcat_version': '0.1.0',
+                'id': 'iterable-literals',
+                'description': '',
+                'catalog_file': 'cat.csv',
+                'attributes': [],
+                'assets': {'column_name': 'path', 'format': 'netcdf'},
+            },
+            f,
+        )
+
+    catalog = intake.open_esm_datastore(
+        tmp_path / 'cat.json', read_kwargs={'converters': {'variable': ast.literal_eval}}
+    )
+    assert catalog.esmcat.columns_with_iterables == {'variable'}
+    assert catalog.df['variable'].astype(object).apply(tuple).tolist() == [expected, expected]
+
+
+def test_parquet_filename_preserves_catalog_name(tmp_path):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    cat.serialize(name='physics', directory=tmp_path, catalog_type='file', file_format='parquet')
+    assert (tmp_path / 'physics.parquet').is_file()
+
+
+@pytest.mark.parametrize('use_model', [False, True])
+def test_serialization_rejects_unknown_file_format(tmp_path, use_model):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    save = cat.esmcat.save if use_model else cat.serialize
+    with pytest.raises(ValueError, match='file_format'):
+        save(name='invalid', directory=tmp_path, catalog_type='file', file_format='orc')
+    assert not (tmp_path / 'invalid.json').exists()
+
+
+@pytest.mark.parametrize(
+    'datastore, file_format',
+    [
+        (catalog_dict_records, 'csv'),
+        (cdf_cat_sample_cmip6, 'csv'),
+        (zarr_cat_aws_cesm, 'csv'),
+        (zarr_cat_pangeo_cmip6, 'csv'),
+        (cdf_cat_sample_cmip5_pq, 'parquet'),
+        (multi_variable_cat, 'csv'),
+        ({'esmcat': sample_esmcat_data, 'df': sample_df}, 'csv'),
+        (intake_esm.cat.ESMCatalogModel.load(cdf_cat_sample_cmip6), 'csv'),
+    ],
+)
+@pytest.mark.parametrize('catalog_type', ['file', 'dict'])
+def test_write_csv_conflict(tmp_path, datastore, file_format, catalog_type):
+    """Test that error is raised when `to_csv_kwargs` conflicts with `write_kwargs`."""
+    cat = intake.open_esm_datastore(datastore)
+
+    kwargs = {
+        'name': 'test_catalog',
+        'directory': tmp_path,
+        'catalog_type': catalog_type,
+        'file_format': file_format,
+        'write_kwargs': {'compression': 'gzip'},
+    }
+
+    # Work when inputs are consistent
+    cat.serialize(**kwargs)
+
+    kwargs['to_csv_kwargs'] = kwargs['write_kwargs']
+    # Fails on conflict
+    with pytest.raises(ValueError):
+        cat.serialize(
+            name='test_catalog',
+            directory=tmp_path,
+            catalog_type='file',
+            file_format=file_format,
+            write_kwargs={'compression': 'gzip'},
+            to_csv_kwargs={'compression': 'gzip'},
+        )
+
+    kwargs.pop('write_kwargs')
+
+    with pytest.warns(
+        DeprecationWarning,
+        match='to_csv_kwargs is deprecated and will be removed in a future version. ',
+    ):
+        cat.serialize(
+            name='test_catalog',
+            directory=tmp_path,
+            catalog_type=catalog_type,
+            file_format=file_format,
+            to_csv_kwargs={'compression': 'gzip'},
+        )
+
+
+def test_dict_serialization_preserves_values():
+    catalog = intake.open_esm_datastore(
+        access_columns_with_lists_cat, columns_with_iterables=['variable']
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        catalog.serialize(
+            name='test_catalog',
+            directory=tmpdir,
+            catalog_type='dict',
+            file_format='csv',
+            storage_options={},
+        )
+
+        catalog2 = intake.open_esm_datastore(
+            Path(tmpdir) / 'test_catalog.json',
+            columns_with_iterables=['variable'],
+        )
+
+    pd.testing.assert_frame_equal(
+        catalog.df,
+        catalog2.df,
+        check_dtype=False,
+    )
+
+
+@pytest.mark.parametrize(
     'query,regex',
     [
         ({'variables': ['FLNS', 'FLUT']}, r'Variable derivation requires'),
@@ -323,6 +548,8 @@ def test_catalog_keys_info(cat):
     [
         ('file', {'compression': 'bz2'}, {}, '.'),
         ('file', {'compression': 'gzip'}, {}, None),
+        ('file', {'compression': 'xz'}, {}, '.'),
+        ('file', {'compression': 'zip'}, {}, '.'),
         ('dict', {}, {}, None),
     ],
 )
@@ -357,6 +584,7 @@ def test_catalog_serialize(catalog_type, to_csv_kwargs, json_dump_kwargs, direct
             if cat.esmcat._frames.pl_df.get_column(colname).is_null().all()
         ]
     )
+
     assert_frame_equal_pl(
         subset_df,
         df,
@@ -763,3 +991,122 @@ def test_to_dask_returns_real_single_dataset():
             xr.testing.assert_equal(ds.tasmax.isel(member_id=0, drop=True), original.tasmax)
     finally:
         ds.close()
+
+
+@pytest.mark.parametrize('dtype', [pl.List(pl.String), pl.List(pl.Categorical)])
+def test_iterable_schema_overrides(dtype):
+    cat = intake.open_esm_datastore(
+        multi_variable_cat,
+        columns_with_iterables=['variable'],
+        read_kwargs={'schema_overrides': {'variable': dtype, 'component': pl.Categorical}},
+    )
+    expected = pd.read_csv(cat.esmcat.catalog_file, converters={'variable': ast.literal_eval})
+    assert cat.esmcat.pl_df.schema['variable'] == dtype
+    assert cat.esmcat.pl_df.schema['component'] == pl.Categorical
+    assert cat.esmcat.pl_df['variable'].to_list() == [list(v) for v in expected.variable]
+    assert cat.esmcat.pl_df['component'].to_list() == expected.component.tolist()
+
+
+def test_numeric_iterable_schema_override(tmp_path):
+    with open(multi_variable_cat) as f:
+        metadata = json.load(f)
+    source = intake.open_esm_datastore(multi_variable_cat, columns_with_iterables=['variable'])
+    table = pd.read_csv(source.esmcat.catalog_file)
+    table['levels'] = str([1, 2])
+    table.to_csv(tmp_path / 'catalog.csv', index=False)
+    metadata['catalog_file'] = 'catalog.csv'
+    (tmp_path / 'catalog.json').write_text(json.dumps(metadata))
+    cat = intake.open_esm_datastore(
+        tmp_path / 'catalog.json',
+        columns_with_iterables=['variable', 'levels'],
+        read_kwargs={'schema_overrides': {'levels': pl.List(pl.Int64)}},
+    )
+    assert cat.esmcat.pl_df.schema['levels'] == pl.List(pl.Int64)
+    assert cat.esmcat.pl_df['levels'].to_list() == [[1, 2]] * len(table)
+
+
+@pytest.mark.parametrize(
+    'catalog, _driver',
+    [
+        (
+            cdf_cat_sample_cmip5_pq,
+            PolarsParquetReader,
+        ),
+    ],
+)
+@pytest.mark.parametrize('df_reader', ['pandas', 'polars', 'infer'])
+def test_df_reader_parquet(catalog, df_reader, _driver):
+    if df_reader == 'pandas':
+        with pytest.warns(UserWarning, match='Pandas parquet reader is not implemented yet.'):
+            cat = intake.open_esm_datastore(catalog, df_reader=df_reader)
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')  # Turn warnings into errors
+            cat = intake.open_esm_datastore(catalog, df_reader=df_reader)
+
+        assert isinstance(cat.esmcat._driver, _driver)
+
+
+@pytest.mark.parametrize(
+    'catalog, df_reader, _driver',
+    [
+        (
+            cdf_cat_sample_cmip5,
+            'polars',
+            PolarsCsvReader,
+        ),
+        (
+            cdf_cat_sample_cmip5,
+            'pandas',
+            PandasCsvReader,
+        ),
+        (
+            cdf_cat_sample_cmip5,
+            'infer',
+            PandasCsvReader,
+        ),
+        (
+            access_columns_with_lists_bz2_cat,
+            'polars',
+            PandasCsvReader,
+        ),
+        (
+            access_columns_with_lists_bz2_cat,
+            'pandas',
+            PandasCsvReader,
+        ),
+        (
+            access_columns_with_lists_bz2_cat,
+            'infer',
+            PandasCsvReader,
+        ),
+    ],
+)
+def test_df_reader_csv(catalog, df_reader, _driver):
+    cat = intake.open_esm_datastore(catalog, df_reader=df_reader)
+    assert isinstance(cat.esmcat._driver, _driver)
+    if df_reader == 'pandas':
+        cat.df
+        assert cat.esmcat._driver.frames.pl_df is None
+        cat.esmcat._driver.frames.polars
+        assert cat.esmcat._driver.frames.pl_df is not None
+
+
+@pytest.mark.parametrize(
+    'env_reader, explicit_reader, expected',
+    [
+        (None, None, PolarsCsvReader),
+        ('pandas', None, PandasCsvReader),
+        ('pandas', 'polars', PolarsCsvReader),
+        ('polars', 'pandas', PandasCsvReader),
+    ],
+)
+def test_reader_selection_precedence(monkeypatch, env_reader, explicit_reader, expected):
+    if env_reader is None:
+        monkeypatch.delenv('ITK_ESM_DF_READER', raising=False)
+    else:
+        monkeypatch.setenv('ITK_ESM_DF_READER', env_reader)
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip5, df_reader=explicit_reader)
+    assert isinstance(cat.esmcat._driver, expected)
+    reference = pd.read_csv(cat.esmcat.catalog_file, dtype=str)
+    pd.testing.assert_frame_equal(cat.df, reference, check_dtype=False)
